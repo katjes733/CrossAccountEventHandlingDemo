@@ -1,0 +1,847 @@
+# MIT License
+
+# Copyright (c) 2022 Martin Macecek
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Regional prerequisites for CD Pipeline
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  ResourcePrefix:
+    Description: Prefix for all resources to better identify related resources
+    Type: String
+    Default: 'w-pasx-'
+    AllowedPattern: ^$|^[a-z0-9-]{0,7}$
+  HubAccount:
+    Description: Account number of the Hub Account with CodeCommit
+    ConstraintDescription: Must be a valid Account number or empty
+    Type: String
+    Default: '406335548310'
+    AllowedPattern: ^$|\d{12}$
+  HubRegion:
+    Description: Region of the Hub Account with CodeCommit
+    ConstraintDescription: Must be a valid region or empty
+    Type: String
+    Default: 'us-east-1'
+    AllowedPattern: ^$|[a-z]{2}-(gov-){0,1}(north|northeast|east|southeast|south|southwest|west|northwest|central)-[1-9]{1}
+  PrincipleOrgId:
+    Description: Principle Organizational ID that contains all accounts
+    ConstraintDescription: Must be a valid Principle Organizational ID or empty
+    Type: String
+    Default: 'ou-40t1-yokqpigy'
+    AllowedPattern: ^$|^o-[a-z0-9]{10}|r-[a-z0-9]{4}|ou-[a-z0-9]{4}-[a-z0-9]{8}$
+  NotificationConfigurationTableName:
+    Description: Custom name for the Table containing the configuration of spoke accounts event buses to reveice events from the Hub Account
+    ConstraintDescription: Must be a valid table name without resource prefix
+    Type: String
+    Default: 'NotificationConfiguration'
+    AllowedPattern: ^[a-zA-Z0-9_.-]{3,248}$
+  CrossAccountNotificationEventBusName:
+    Description: Custom name for the Event bus receiving events from the Hub Account
+    ConstraintDescription: Must be a valid EventBus name without resource prefix
+    Type: String
+    Default: 'CrossAccountNotification'
+    AllowedPattern: ^[/\.\-_A-Za-z0-9]{1,248}$
+  NotificationSubscriptionEventBusName:
+    Description: Custom name for the Event bus receiving subscription events from the Spoke Account
+    ConstraintDescription: Must be a valid EventBus name without resource prefix
+    Type: String
+    Default: 'NotificationSubscription'
+    AllowedPattern: ^[/\.\-_A-Za-z0-9]{1,248}$  
+  RepositoryName:
+    Description: Name of the CodeCommit repository
+    ConstraintDescription: Must be a valid CodeCommit repository name and cannot be empty
+    Type: String
+    Default: 'pasxaws-32-test'
+    AllowedPattern: ^[\w\.-]{1,100}$
+  BranchName:
+    Description: Name of the CodeCommit branch to monitor for code changes
+    ConstraintDescription: Must be a valid GIT branch name and cannot be empty
+    Type: String
+    Default: 'feature/mac-testing'
+    AllowedPattern: ^((feature|release|bugfix|hotfix)\/)?[\w\.\-]{1,80}$
+
+# -----------------------------------------------------------------------------
+# Conditions
+# -----------------------------------------------------------------------------
+Conditions:
+  IsSpokeAccount: !And [!Not [!Equals [!Ref HubAccount, '']], !Not [!Equals [!Ref HubAccount, !Ref AWS::AccountId]]]
+  IsHubAccount: !Or [!Equals [!Ref HubAccount, ''], !Equals [!Ref HubAccount, !Ref AWS::AccountId]]
+  IsArmSupportedRegion: !Or [!Equals ['us-east-1', !Ref AWS::Region], !Equals ['us-west-2', !Ref AWS::Region], !Equals ['eu-central-1', !Ref AWS::Region], !Equals ['eu-west-1', !Ref AWS::Region], !Equals ['ap-south-1', !Ref AWS::Region], !Equals ['ap-southeast-1', !Ref AWS::Region], !Equals ['ap-southeast-2', !Ref AWS::Region], !Equals ['ap-northeast-1', !Ref AWS::Region]]
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+  HubEventDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Replacement not necessary"
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}HubEventDeliveryRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  HubEventDeliveryRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: '* needed, actions do not support resource level permissions'
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}HubEventDeliveryRolePolicy-${AWS::Region}'
+      PolicyDocument:        
+        Statement:    
+          - Action:
+              - 'events:PutEvents'
+            Effect: Allow
+            Resource: !Sub 'arn:aws:events:${AWS::Region}:*:event-bus/*'
+          - Action:              
+              - 'dynamodb:GetItem'
+            Effect: Allow
+            Resource: !GetAtt NotificationConfigurationTable.Arn
+        Version: 2012-10-17      
+      Roles:
+        - !Ref HubEventDeliveryRole
+  HubEventDeliveryLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "No critical data in logs"
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}HubEventDelivery'
+  HubEventDeliveryFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsHubAccount
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Provided by managed policy AWSLambdaBasicExecutionRole in HubEventDeliveryRole"
+          - id: W89
+            reason: "No need for VPC here"
+          - id: W92
+            reason: "No concurrency needed"
+    DependsOn: 
+      - HubEventDeliveryLogGroup
+      - HubEventDeliveryRolePolicy
+    Properties: 
+      FunctionName: !Sub '${ResourcePrefix}HubEventDelivery'
+      Architectures: 
+        - !If 
+          - IsArmSupportedRegion
+          - arm64
+          - x86_64
+      Code: 
+        ZipFile: |          
+          import json, boto3, botocore, logging, os
+          import datetime as dt
+
+          levels = {
+              'critical': logging.CRITICAL,
+              'error': logging.ERROR,
+              'warn': logging.WARNING,
+              'info': logging.INFO,
+              'debug': logging.DEBUG
+          }
+          logger = logging.getLogger()
+          try:   
+              logger.setLevel(levels.get(os.getenv('LOG_LEVEL', 'info').lower()))
+          except KeyError as e:
+              logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"event: {event}")
+              eventPrefix = os.getenv('EVENT_PREFIX', 'custom')
+              sourceSuffix = event['source'].replace("aws", "")
+              repoArns = event['resources']
+              ebClient = boto3.client('events')
+              for repoArn in event['resources']:
+                  processedEventBusArns = set()
+                  for eventBusArn in getDestinationConfiguration(repoArn):
+                      if eventBusArn not in processedEventBusArns:
+                          newEvent = {
+                              'Time': dt.datetime.fromisoformat(event['time'][:-1]),
+                              'Source': f'{eventPrefix}{sourceSuffix}',
+                              'Resources': [repoArn],
+                              'DetailType': event['detail-type'],
+                              'Detail': json.dumps(event['detail']),
+                              'EventBusName': eventBusArn
+                          }
+                          logger.debug(f"Event entries to be sent: {newEvent}")
+                          try:
+                              ebClient.put_events(Entries = [newEvent])
+                              logger.info(f"Event successfully forwarded to event bus: {eventBusArn}")
+                              processedEventBusArns.add(eventBusArn)
+                          except botocore.exceptions.ClientError as err:
+                              errCode = err.response['Error']['Code']
+                              errMsg = err.response['Error']['Message']
+                              if errCode == 'AccessDeniedException':
+                                  logger.error(f"Account {account} does not allow writing to the following event bus: {eventBusArn}")
+                              else:
+                                  logger.error(f"Unexpected error: {errCode} {errMsg}")
+                          except Exception as e:
+                              logger.error(f"Unexpected error: {e}")
+                      else:
+                          logger.info(f"Event was already successfully forwarded to event bus {eventBusArn} before and is therefore skipped.")
+
+          def getDestinationConfiguration(repoArn):
+              dynamoDb = boto3.resource('dynamodb')
+              tableName = os.getenv('TABLE_NAME')
+              table = dynamoDb.Table(tableName)
+              response = table.get_item(Key = {'RepositoryArn': repoArn})
+              returnValue = []
+              if 'Item' in response:
+                  returnValue = response['Item']['Destinations']
+              return returnValue
+
+      Description: Hub event delivery function
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt HubEventDeliveryRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: info
+          EVENT_PREFIX: crossaccount
+          TABLE_NAME: !Ref NotificationConfigurationTable
+  HubEventDeliveryPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsHubAccount
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt HubEventDeliveryFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CodeCommitEventRule.Arn
+  CodeCommitEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsHubAccount
+    Properties:
+      Name: !Sub '${ResourcePrefix}CodeCommitEventRule'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - prefix: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+      Targets:
+        - Arn: !GetAtt HubEventDeliveryFunction.Arn      
+          Id: !Sub '${ResourcePrefix}HubEventDeliveryFunction'  
+  NotificationConfigurationTableKmsKey:
+    Type: AWS::KMS::Key  
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F76
+            reason: "False Positive - because we are using a Condition"
+    Condition: IsHubAccount
+    Properties:
+      Description: Used to encrypt CrossAccount Code Commit Configuration table
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Ref AWS::StackName
+        Statement:
+          - Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow use of key in lambda
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey,
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:ViaService: "dynamodb.*.amazonaws.com"
+  NotificationConfigurationTableKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsHubAccount
+    Properties:
+      AliasName: !Sub 'alias/${ResourcePrefix}NotificationConfigurationTable-${AWS::Region}'
+      TargetKeyId: !Ref NotificationConfigurationTableKmsKey
+  NotificationConfigurationTable: 
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Replacement not necessary"
+    Condition: IsHubAccount
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: "RepositoryArn"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "RepositoryArn"
+          KeyType: "HASH"
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: !Ref NotificationConfigurationTableName
+      PointInTimeRecoverySpecification:
+         PointInTimeRecoveryEnabled: true
+      # SSESpecification:
+      #   KMSMasterKeyId: !Ref NotificationConfigurationTableKmsKey
+      #   SSEEnabled: true
+      #   SSEType: KMS
+  # Create Event Bus for all cross account related events
+  NotificationSubscriptionEventBus: 
+    Type: AWS::Events::EventBus
+    Condition: IsHubAccount
+    Properties: 
+        Name: !Sub '${ResourcePrefix}${NotificationSubscriptionEventBusName}'  
+  NotificationSubscriptionEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Condition: IsHubAccount
+    Properties: 
+      EventBusName: !GetAtt NotificationSubscriptionEventBus.Name
+      StatementId: !Sub '${ResourcePrefix}NotificationSubscriptionEventBus'
+      Statement: 
+        Effect: 'Allow'
+        Principal: '*'
+        Action: 'events:PutEvents'
+        Resource: !GetAtt NotificationSubscriptionEventBus.Arn
+        Condition:
+          ForAnyValue:StringLike:
+            aws:PrincipalOrgPaths: !Sub '*/${PrincipleOrgId}/*'
+  NotificationConfigurationRole:
+    Type: 'AWS::IAM::Role'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Replacement not necessary"
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}NotificationConfigurationRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  NotificationConfigurationRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: '* needed, actions do not support resource level permissions'
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}NotificationConfigurationRolePolicy-${AWS::Region}'
+      PolicyDocument:        
+        Statement:    
+          - Action:
+              - 'dynamodb:BatchGetItem'
+              - 'dynamodb:GetItem'
+              - 'dynamodb:Query'
+              - 'dynamodb:Scan'
+              - 'dynamodb:BatchWriteItem'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:UpdateItem'
+            Effect: Allow
+            Resource: !GetAtt NotificationConfigurationTable.Arn
+        Version: 2012-10-17      
+      Roles:
+        - !Ref NotificationConfigurationRole
+  NotificationConfigurationLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: IsHubAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "No critical data in logs"
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}NotificationConfiguration'
+  NotificationConfigurationFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsHubAccount
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Provided by managed policy AWSLambdaBasicExecutionRole in NotificationConfigurationRole"
+          - id: W89
+            reason: "No need for VPC here"
+          - id: W92
+            reason: "No concurrency needed"
+    DependsOn: 
+      - NotificationConfigurationLogGroup
+      - NotificationConfigurationRolePolicy
+    Properties: 
+      FunctionName: !Sub '${ResourcePrefix}NotificationConfiguration'
+      Architectures: 
+        - !If 
+          - IsArmSupportedRegion
+          - arm64
+          - x86_64
+      Code: 
+        ZipFile: |          
+          import boto3, logging, os
+
+          levels = {
+              'critical': logging.CRITICAL,
+              'error': logging.ERROR,
+              'warn': logging.WARNING,
+              'info': logging.INFO,
+              'debug': logging.DEBUG
+          }
+          logger = logging.getLogger()
+          try:   
+              logger.setLevel(levels.get(os.getenv('LOG_LEVEL', 'info').lower()))
+          except KeyError as e:
+              logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"event: {event}")
+              dynamoDb = boto3.resource('dynamodb')
+              tableName = os.getenv('TABLE_NAME')
+              action = event['detail']['action']
+              repoArn = event['detail']['repositoryArn']
+              eventBusArn = event['detail']['eventBusArn']
+              table = dynamoDb.Table(tableName)
+              
+              if action == "Update":
+                  oldRepoArn = event['detail']['oldRepositoryArn']
+                  oldEventBusArn = event['detail']['oldEventBusArn']
+                  oldResponse = table.get_item(Key = {'RepositoryArn': oldRepoArn})
+                  if 'Item' in oldResponse:
+                      logger.info(f"{action}: Existing item found in table {tableName} with RepositoryArn={oldRepoArn}.")
+                      config = oldResponse['Item']
+                      destinations = config['Destinations']
+                      if oldEventBusArn in destinations:
+                          logger.info(f"{action}: Destination {oldEventBusArn} exists {destinations.count(oldEventBusArn)}-times and therefore one element is removed.")
+                          destinations.remove(oldEventBusArn)
+                          response = table.put_item(Item = config)
+              
+              response = table.get_item(Key = {'RepositoryArn': repoArn})
+              config = None
+              if 'Item' in response:
+                  logger.info(f"{action}: Existing item found in table {tableName} with RepositoryArn={repoArn}.")
+                  config = response['Item']
+                  destinations = config['Destinations']
+                  if action == "Delete":
+                      if eventBusArn in destinations:
+                          logger.info(f"{action}: Destination {eventBusArn} exists {destinations.count(eventBusArn)}-times and therefore one element is removed.")
+                          destinations.remove(eventBusArn)
+                  else:
+                      if eventBusArn not in destinations:
+                          logger.info(f"{action}: New destination {eventBusArn} does not yet exist and is therefore added as first element.")
+                      else:
+                          logger.info(f"{action}: New destination {eventBusArn} exists and is therefore added as additional element.")
+                      destinations.append(eventBusArn)
+              else:
+                  if action != "Delete":
+                      logger.info(f"{action}: No item found in table {tableName} with RepositoryArn={repoArn}. Creating new item with destination {eventBusArn}.")
+                      config = {
+                          "RepositoryArn": repoArn,
+                          "Destinations": [eventBusArn]
+                      }
+              if config is not None:
+                  response = table.put_item(Item = config)
+
+      Description: Notification configuration function
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt NotificationConfigurationRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: info
+          TABLE_NAME: !Ref NotificationConfigurationTable
+  NotificationConfigurationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsHubAccount
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt NotificationConfigurationFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotificationConfigurationEventRule.Arn
+  NotificationConfigurationEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsHubAccount
+    Properties:
+      Name: !Sub '${ResourcePrefix}NotificationConfigurationEventRule'
+      EventBusName: !GetAtt NotificationSubscriptionEventBus.Arn
+      EventPattern:
+        source:
+          - crossaccount.codecommit
+        detail-type:
+          - 'Destination Configuration'
+      Targets:
+        - Arn: !GetAtt NotificationConfigurationFunction.Arn
+          Id: !Sub '${ResourcePrefix}NotificationConfigurationFunction'  
+
+  # -----------------------------------------------------------------------------
+  # Cross Account CodeCommit Resources - Spoke Account
+  # -----------------------------------------------------------------------------
+  CrossAccountNotificationEventBus: 
+    Type: AWS::Events::EventBus
+    Condition: IsSpokeAccount
+    Properties: 
+        Name: !Sub '${ResourcePrefix}${CrossAccountNotificationEventBusName}'  
+  CrossAccountNotificationEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Condition: IsSpokeAccount
+    Properties: 
+      EventBusName: !GetAtt CrossAccountNotificationEventBus.Name
+      StatementId: !Sub '${ResourcePrefix}CrossAccountNotification'
+      Statement: 
+        Effect: 'Allow'
+        Principal: 
+          AWS: !Ref HubAccount
+        Action: 'events:PutEvents'
+        Resource: !GetAtt CrossAccountNotificationEventBus.Arn
+  NotificationSubscriptionRole:
+    Type: 'AWS::IAM::Role'
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Only in case a specific resource prefix is used"
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}NotificationSubscriptionRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  NotificationSubscriptionPolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: '* needed, actions do not support resource level permissions'
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}NotificationSubscriptionPolicy-${AWS::Region}'
+      PolicyDocument:        
+        Statement:    
+          - Action:
+              - 'events:PutEvents'
+            Effect: Allow
+            Resource: !Sub 'arn:aws:events:${AWS::Region}:*:event-bus/*'
+        Version: 2012-10-17      
+      Roles:
+        - !Ref NotificationSubscriptionRole
+  NotificationSubscriptionLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "No critical data in logs"
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}NotificationSubscription'
+  NotificationSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Provided by managed policy AWSLambdaBasicExecutionRole in NotificationSubscriptionRole"
+          - id: W89
+            reason: "No need for VPC here"
+          - id: W92
+            reason: "No concurrency needed"
+    DependsOn: 
+      - NotificationSubscriptionLogGroup
+      - NotificationSubscriptionPolicy
+    Properties: 
+      FunctionName: !Sub '${ResourcePrefix}NotificationSubscription'
+      Architectures:  
+        - !If 
+          - IsArmSupportedRegion
+          - arm64
+          - x86_64
+      Code: 
+        ZipFile: |          
+          import cfnresponse
+          import json, boto3, botocore, logging, os
+          from datetime import datetime as dt
+
+          levels = {
+              'critical': logging.CRITICAL,
+              'error': logging.ERROR,
+              'warn': logging.WARNING,
+              'info': logging.INFO,
+              'debug': logging.DEBUG
+          }
+          logger = logging.getLogger()
+          try:   
+              logger.setLevel(levels.get(os.getenv('LOG_LEVEL', 'info').lower()))
+          except KeyError as e:
+              logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"event: {event}")
+              try:
+                  eventBusArn = event['ResourceProperties']['EventBusArn']
+                  configEvent = None
+                  if event['RequestType'] == 'Update':
+                      configEvent = {
+                          'Time': dt.now().isoformat(),
+                          'Source': 'crossaccount.codecommit',
+                          'DetailType': 'Destination Configuration',
+                          'Resources': [],
+                          'Detail': json.dumps({
+                              'action': event['RequestType'],
+                              'repositoryArn': event['ResourceProperties']['CodeCommitArn'],
+                              'eventBusArn': event['ResourceProperties']['DestEventBusArn'],
+                              'oldRepositoryArn': event['OldResourceProperties']['CodeCommitArn'],
+                              'oldEventBusArn': event['OldResourceProperties']['DestEventBusArn']
+                          }),
+                          'EventBusName': eventBusArn
+                      }
+                  else:
+                      configEvent = {
+                          'Time': dt.now().isoformat(),
+                          'Source': 'crossaccount.codecommit',
+                          'DetailType': 'Destination Configuration',
+                          'Resources': [],
+                          'Detail': json.dumps({
+                              'action': event['RequestType'],
+                              'repositoryArn': event['ResourceProperties']['CodeCommitArn'],
+                              'eventBusArn': event['ResourceProperties']['DestEventBusArn']
+                          }),
+                          'EventBusName': eventBusArn
+                      } 
+
+                  logger.debug(f"Configuration Event to be sent: {configEvent}")
+                  ebClient = boto3.client('events')
+                  try:
+                      ebClient.put_events(Entries = [configEvent])
+                      logger.info(f"Event successfully sent to event bus: {eventBusArn}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event['LogicalResourceId'])
+                  except botocore.exceptions.ClientError as error:
+                      if error.response['Error']['Code'] == 'AccessDeniedException':
+                          logger.error(f"Account {account} does not allow writing to the following event bus: {eventBusArn}")
+                      raise error
+              except Exception as e:
+                  logger.error("Exception: {}".format(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, event['LogicalResourceId'], reason=str(e))
+      Description: Function to subscribe for Cross Account CodeCommit events
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt NotificationSubscriptionRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: info
+
+  # -----------------------------------------------------------------------------
+  # Cross Account CodeCommit Resources - Register this CodePipeline for notification
+  # -----------------------------------------------------------------------------
+  ExecuteNotificationSubscriptionFunction:
+    Condition: IsSpokeAccount
+    Type: Custom::ExecuteNotificationSubscriptionFunction
+    Properties:
+      ServiceToken: !GetAtt NotificationSubscriptionFunction.Arn
+      EventBusArn: !Sub 'arn:aws:events:${HubRegion}:${HubAccount}:event-bus/${ResourcePrefix}${NotificationSubscriptionEventBusName}'
+      CodeCommitArn: !Sub 'arn:aws:codecommit:${HubRegion}:${HubAccount}:${RepositoryName}'
+      DestEventBusArn: !GetAtt CrossAccountNotificationEventBus.Arn
+
+  # -----------------------------------------------------------------------------
+  # Demo resources
+  # -----------------------------------------------------------------------------
+  DemoCodeCommitChangeEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsSpokeAccount
+    Properties:
+      Name: !Sub '${ResourcePrefix}DemoCodeCommitChangeEventRule'
+      EventBusName: !GetAtt CrossAccountNotificationEventBus.Arn
+      EventPattern:
+        source:
+          - crossaccount.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:aws:codecommit:${HubRegion}:${HubAccount}:${RepositoryName}'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !GetAtt DemoFunction.Arn
+          Id: !Sub '${ResourcePrefix}DemoCodeCommitChangeEventRule'
+  
+  DemoRole:
+    Type: 'AWS::IAM::Role'
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Replacement not necessary"
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}DemoRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  DemoLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "No critical data in logs"
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}Demo'
+  DemoFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsSpokeAccount
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Provided by managed policy AWSLambdaBasicExecutionRole in DemoRole"
+          - id: W89
+            reason: "No need for VPC here"
+          - id: W92
+            reason: "No concurrency needed"
+    DependsOn: 
+      - DemoLogGroup
+    Properties: 
+      FunctionName: !Sub '${ResourcePrefix}Demo'
+      Architectures: 
+        - !If 
+          - IsArmSupportedRegion
+          - arm64
+          - x86_64
+      Code: 
+        ZipFile: |          
+          import logging, os
+
+          levels = {
+              'critical': logging.CRITICAL,
+              'error': logging.ERROR,
+              'warn': logging.WARNING,
+              'info': logging.INFO,
+              'debug': logging.DEBUG
+          }
+          logger = logging.getLogger()
+          try:   
+              logger.setLevel(levels.get(os.getenv('LOG_LEVEL', 'info').lower()))
+          except KeyError as e:
+              logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"event: {event}")
+
+      Description: Demonstrates CodeCommit events being forwaded cross account
+      Handler: "index.lambda_handler"
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt DemoRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: info
+  DemoFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsSpokeAccount
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DemoFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DemoCodeCommitChangeEventRule.Arn
