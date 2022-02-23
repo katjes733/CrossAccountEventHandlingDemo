@@ -235,10 +235,15 @@ Resources:
                   returnValue = response['Item']['Destinations']
               return returnValue
 
-          def handleResponse(response):
+          def handleResponse(response, eventBusArn=None):
               logger.info(f"Response: {response}")
               if response['FailedEntryCount'] == 0:
-                  logger.info("All events have been forwarded successfully to their corresponsing Event Buses.")
+                  if len(response['Entries']) > 1:
+                      logger.info("All events have been forwarded successfully to their corresponding Event Buses.")
+                  else:
+                      msg = "its corresponding Event Bus"
+                      msg = f"Event Bus {eventBusArn}" if eventBusArn != None else msg
+                      logger.info(f"One event has been forwarded successfully to {msg}.")
               else:
                   for entry in response['Entries']:
                       if EventId in entry and not entry['EventId']:
@@ -249,8 +254,8 @@ Resources:
           def processEventsIndividually(events):
               for event in events:
                   try:
-                      ebClient.put_events(Entries = [event])
-                      logger.info(f"Event successfully forwarded to event bus: {event['EventBusName']}")
+                      response = ebClient.put_events(Entries = [event])
+                      handleResponse(response, event['EventBusName'])
                   except botocore.exceptions.ClientError as err:
                       errCode = err.response['Error']['Code']
                       errMsg = err.response['Error']['Message']
