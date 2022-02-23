@@ -189,13 +189,15 @@ Resources:
               logger.setLevel(levels.get(os.getenv('LOG_LEVEL', 'info').lower()))
           except KeyError as e:
               logger.setLevel(logging.INFO)
+              
+          ebClient = boto3.client('events')
 
           def lambda_handler(event, context):
               logger.info(f"event: {event}")
               eventPrefix = os.getenv('EVENT_PREFIX', 'custom')
               sourceSuffix = event['source'].replace("aws", "")
               repoArns = event['resources']
-              ebClient = boto3.client('events')
+              events = []
               for repoArn in event['resources']:
                   processedEventBusArns = set()
                   for eventBusArn in getDestinationConfiguration(repoArn):
@@ -209,22 +211,20 @@ Resources:
                               'EventBusName': eventBusArn
                           }
                           logger.debug(f"Event entries to be sent: {newEvent}")
-                          try:
-                              ebClient.put_events(Entries = [newEvent])
-                              logger.info(f"Event successfully forwarded to event bus: {eventBusArn}")
-                              processedEventBusArns.add(eventBusArn)
-                          except botocore.exceptions.ClientError as err:
-                              errCode = err.response['Error']['Code']
-                              errMsg = err.response['Error']['Message']
-                              if errCode == 'AccessDeniedException':
-                                  logger.error(f"Account {account} does not allow writing to the following event bus: {eventBusArn}")
-                              else:
-                                  logger.error(f"Unexpected error: {errCode} {errMsg}")
-                          except Exception as e:
-                              logger.error(f"Unexpected error: {e}")
+                          events.append(newEvent)
+                          logger.info(f"Event scheduled to be forwarded to event bus: {eventBusArn}")
+                          processedEventBusArns.add(eventBusArn)
                       else:
-                          logger.info(f"Event was already successfully forwarded to event bus {eventBusArn} before and is therefore skipped.")
-
+                          logger.info(f"Event was already included to be forwarded to event bus {eventBusArn} before and is therefore skipped.")
+              if events:
+                  try:
+                      logger.info("Processing events in bulk...")
+                      response = ebClient.put_events(Entries = events)
+                      handleResponse(response)
+                  except Exception as e:
+                      logger.info("Unexpected error occurred during bulk processing, falling back to individual processing...")
+                      processEventsIndividually(events)
+                  
           def getDestinationConfiguration(repoArn):
               dynamoDb = boto3.resource('dynamodb')
               tableName = os.getenv('TABLE_NAME')
@@ -234,6 +234,32 @@ Resources:
               if 'Item' in response:
                   returnValue = response['Item']['Destinations']
               return returnValue
+
+          def handleResponse(response):
+              logger.info(f"Response: {response}")
+              if response['FailedEntryCount'] == 0:
+                  logger.info("All events have been forwarded successfully to their corresponsing Event Buses.")
+              else:
+                  for entry in response['Entries']:
+                      if EventId in entry and not entry['EventId']:
+                          logger.info(f"Event ID {entry['EventId']} was processed successfully.")
+                      else:
+                          logger.error(f"Event processing failed with error code {entry['ErrorCode']}: {entry['ErrorMessage']}")
+                          
+          def processEventsIndividually(events):
+              for event in events:
+                  try:
+                      ebClient.put_events(Entries = [event])
+                      logger.info(f"Event successfully forwarded to event bus: {event['EventBusName']}")
+                  except botocore.exceptions.ClientError as err:
+                      errCode = err.response['Error']['Code']
+                      errMsg = err.response['Error']['Message']
+                      if errCode == 'AccessDeniedException':
+                          logger.error(f"Cannot write to the following event bus: {event['EventBusName']}")
+                      else:
+                          logger.error(f"Unexpected error: {errCode} {errMsg}")
+                  except Exception as e:
+                      logger.error(f"Unexpected error: {e}")
 
       Description: Hub event delivery function
       Handler: "index.lambda_handler"
